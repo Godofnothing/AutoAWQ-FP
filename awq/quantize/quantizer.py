@@ -24,6 +24,9 @@ from awq.utils.module import (
     exclude_layers_to_not_quantize,
 )
 
+from .quant_args import QuantizationFormat
+from .quant_ops import FP8_E4M3_MAX, FP4_E2M1_MAX, get_quantization_range, get_quantization_fns, cast_to_eBm0
+
 
 class AwqQuantizer:
     def __init__(
@@ -33,7 +36,6 @@ class AwqQuantizer:
         tokenizer,
         w_bit,
         group_size,
-        zero_point,
         version,
         calib_data,
         split,
@@ -46,13 +48,16 @@ class AwqQuantizer:
         max_calib_samples=128,
         max_calib_seq_len=512,
         max_chunk_memory=1024 * 1024 * 1024,
+        format="int",
+        real_quant=True,
     ) -> None:
         self.awq_model = awq_model
         self.model = model
         self.tokenizer = tokenizer
         self.w_bit = w_bit
         self.group_size = group_size
-        self.zero_point = zero_point
+        # FP formats support only symmetric quantization
+        self.zero_point = False
         self.version = version
         self.calib_data = calib_data
         self.split = split
@@ -64,6 +69,8 @@ class AwqQuantizer:
         self.max_calib_samples = max_calib_samples
         self.max_calib_seq_len = max_calib_seq_len
         self.max_chunk_memory = max_chunk_memory
+        self.format = format
+        self.real_quant = real_quant
         self.modules_to_not_convert = (
             modules_to_not_convert if modules_to_not_convert is not None else []
         )
@@ -79,26 +86,21 @@ class AwqQuantizer:
         assert w.dim() == 2
         assert torch.isnan(w).sum() == 0
 
-        # zero point quantization
-        if self.zero_point:
-            max_val = w.amax(dim=1, keepdim=True)
-            min_val = w.amin(dim=1, keepdim=True)
-            max_int = 2**self.w_bit - 1
-            min_int = 0
-            scales = (max_val - min_val).clamp(min=1e-5) / max_int
-            zeros = (-torch.round(min_val / scales)).clamp_(min_int, max_int)
-            w = (
-                torch.clamp(torch.round(w / scales) + zeros, min_int, max_int) - zeros
-            ) * scales
-            zeros = zeros.view(org_w_shape[0], -1)
-        else:
-            max_val = w.abs().amax(dim=1, keepdim=True)
-            max_val = max_val.clamp(min=1e-5)
-            max_int = 2 ** (self.w_bit - 1) - 1
-            min_int = -(2 ** (self.w_bit - 1))
-            scales = max_val / max_int
-            zeros = None
-            w = torch.clamp(torch.round(w / scales), min_int, max_int) * scales
+        q_min, q_max = get_quantization_range(self.format, self.w_bit, True)
+        quantize_dequantize_fn = get_quantization_fns(self.format, self.w_bit)[2]
+    
+        max_val = w.abs().amax(dim=1, keepdim=True)
+        max_val = max_val.clamp(min=1e-5)
+        scales = 2 * max_val / (q_max - q_min)
+        # For NVFP4 format one has to quantize scale to FP8
+        if self.format == QuantizationFormat.NVFP:
+            global_scale = scales.max() / FP8_E4M3_MAX
+            scales = scales.div(global_scale).to(torch.float8_e4m3fn).to(w.dtype).mul(global_scale)
+        # For MXFP format one has to quantize scale to E8M0
+        elif self.format == QuantizationFormat.MXFP:
+            scales = FP4_E2M1_MAX * cast_to_eBm0(scales, ebits=8, emax=2)
+        zeros = torch.zeros_like(scales)
+        w = quantize_dequantize_fn(w, scales, zeros, q_min, q_max)
 
         assert torch.isnan(scales).sum() == 0
         assert torch.isnan(w).sum() == 0
@@ -115,12 +117,8 @@ class AwqQuantizer:
         repeat_count = w.weight.data.shape[-1] // scales.shape[-1]
         scales = scales.repeat(1, repeat_count).reshape(w.weight.data.shape)
 
-        # dequantize
-        if self.zero_point:
-            zeros = zeros.repeat(1, repeat_count).reshape(w.weight.data.shape)
-            w = (w.weight.data - zeros) * scales
-        else:
-            w = w.weight.data * scales
+        dequantize_fn = get_quantization_fns(self.format, self.w_bit)[1]
+        w = dequantize_fn(w.weight.data, scales)
 
         return w
 
@@ -233,36 +231,41 @@ class AwqQuantizer:
                 linear_layer.weight.data
             )
 
-            if self.version == "gemm":
-                scales = scales.t().contiguous()
-                if zeros is not None:
-                    zeros = zeros.t().contiguous()
-                q_linear_module = WQLinear_GEMM
+            if self.real_quant:
+                assert self.format == "int", "Only integer quantization supported for real quant"
 
-            elif self.version == "gemv":
-                q_linear_module = WQLinear_GEMV
+                if self.version == "gemm":
+                    scales = scales.t().contiguous()
+                    if zeros is not None:
+                        zeros = zeros.t().contiguous()
+                    q_linear_module = WQLinear_GEMM
 
-            elif self.version == "marlin":
-                q_linear_module = WQLinear_Marlin
+                elif self.version == "gemv":
+                    q_linear_module = WQLinear_GEMV
 
-            elif self.version == "gemv_fast":
-                q_linear_module = WQLinear_GEMVFast
+                elif self.version == "marlin":
+                    q_linear_module = WQLinear_Marlin
 
-            else:
-                raise ValueError(f"Unknown version {self.version}")
+                elif self.version == "gemv_fast":
+                    q_linear_module = WQLinear_GEMVFast
 
-            q_linear = q_linear_module.from_linear(
-                linear=linear_layer,
-                w_bit=self.w_bit,
-                group_size=self.group_size,
-                init_only=False,
-                scales=scales,
-                zeros=zeros,
-            )
+                else:
+                    raise ValueError(f"Unknown version {self.version}")
+
+                q_linear = q_linear_module.from_linear(
+                    linear=linear_layer,
+                    w_bit=self.w_bit,
+                    group_size=self.group_size,
+                    init_only=False,
+                    scales=scales,
+                    zeros=zeros,
+                )
+
+                
+                q_linear.to(next(module.parameters()).device)
+                set_op_by_name(module, name, q_linear)  
 
             linear_layer.cpu()
-            q_linear.to(next(module.parameters()).device)
-            set_op_by_name(module, name, q_linear)
             clear_memory()
 
     @torch.no_grad()
